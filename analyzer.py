@@ -2,7 +2,6 @@
 from __future__ import annotations
 import json, os, re
 from typing import Any, Dict, List, Optional, Tuple
-
 import pandas as pd
 
 def try_json_loads(s: Any) -> Optional[Dict[str, Any]]:
@@ -51,15 +50,14 @@ def extract_error_fields(s: Any) -> Dict[str, Any]:
         "beacon_action": lb.get("action"),
     }
 
-IP_RE      = re.compile(r"\b(?:(?:\d{1,3}\.){3}\d{1,3})\b")
-HEX_ID_RE  = re.compile(r"\b[0-9a-fA-F]{6,}\b")
-NUM_ID_RE  = re.compile(r"\b\d{6,}\b")
-ISO_DT_RE  = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z")
-WS_RE      = re.compile(r"\s+")
-BRACKET_RE = re.compile(r"\[[^\]]+\]")
-CODE1      = re.compile(r"ErrorCode:\s*(\d+)")
-CODE2      = re.compile(r"^(\d{3})\s*-\s*")
-
+IP_RE = re.compile(r"\b(?:(?:\d{1,3}\.){3}\d{1,3})\b")
+HEX_ID_RE = re.compile(r"\b[0-9a-fA-F]{6,}\b")
+NUM_ID_RE = re.compile(r"\b\d{6,}\b")
+ISO_DT_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z")
+WS_RE = re.compile(r"\s+")
+BRACKET_RE = re.compile(r"\[[^\]]]+\]")
+CODE1 = re.compile(r"ErrorCode:\s*(\d+)")
+CODE2 = re.compile(r"^(\d{3})\s*-\s*")
 EMAIL_RE = re.compile(r"(?i)(?<![\w\.-])([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})(?![\w\.-])")
 
 def redact_emails_in_string(s: Any) -> Any:
@@ -131,43 +129,62 @@ def combine_dataframes(dfs: List[pd.DataFrame], names: List[str]) -> pd.DataFram
         return pd.DataFrame()
     return pd.concat(frames, axis=0, ignore_index=True)
 
+def _ensure_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    return df
+
+def _reorder_with_priority(df: pd.DataFrame, priority: List[str]) -> pd.DataFrame:
+    priority_present = [c for c in priority if c in df.columns]
+    rest = [c for c in df.columns if c not in priority_present]
+    return df.loc[:, priority_present + rest]
+
 def analyze_dataframes(
     dataframes: List[pd.DataFrame],
     file_names: List[str],
     top_n: int = 10,
     dedupe_rows: bool = False
 ) -> Tuple[Dict[str, Any], Dict[str, pd.DataFrame]]:
+    
     df = combine_dataframes(dataframes, file_names)
 
+    # Required core columns
     for c in ["datetime", "action", "status", "networkName", "networkId", "lastBeacon"]:
         if c not in df.columns:
             df[c] = None
+
+    # Tenant fields
+    df = _ensure_columns(df, ["customerId", "companySize"])
 
     if dedupe_rows:
         df = df.drop_duplicates().reset_index(drop=True)
 
     df["status_norm"] = df["status"].apply(norm_status)
 
+    # Extract lastBeacon fields
     lb_df = df["lastBeacon"].apply(extract_error_fields).apply(pd.Series)
     df = pd.concat([df, lb_df], axis=1)
 
+    # Sanitize
     df = sanitize_drop_email_columns(df)
     df = sanitize_redact_emails(df)
 
+    # Stats
     op_success = int((df["status_norm"] == "success").sum())
-    op_failed  = int((df["status_norm"] == "failed").sum())
+    op_failed = int((df["status_norm"] == "failed").sum())
 
-    net_grp         = df.groupby("networkId", dropna=False)
+    net_grp = df.groupby("networkId", dropna=False)
     net_has_success = net_grp["status_norm"].apply(lambda s: (s == "success").any())
-    net_has_failed  = net_grp["status_norm"].apply(lambda s: (s == "failed").any())
-
-    broken_mask        = (net_has_failed) & (~net_has_success)
+    net_has_failed = net_grp["status_norm"].apply(lambda s: (s == "failed").any())
+    broken_mask = (net_has_failed) & (~net_has_success)
     broken_network_ids = list(net_has_success.index[broken_mask])
 
+    # Failed ops processing
     failed_ops = df[df["status_norm"] == "failed"].copy()
     failed_ops["raw_error_full"] = failed_ops.apply(canonical_error_full, axis=1)
-    failed_ops["error_norm"]     = failed_ops["raw_error_full"].apply(normalize_error_text)
-    failed_ops["error_code"]     = failed_ops["raw_error_full"].apply(extract_code)
+    failed_ops["error_norm"] = failed_ops["raw_error_full"].apply(normalize_error_text)
+    failed_ops["error_code"] = failed_ops["raw_error_full"].apply(extract_code)
 
     def pick_example_message(g: pd.DataFrame) -> str:
         g2 = g.sort_values("datetime", ascending=False) if "datetime" in g.columns else g
@@ -192,23 +209,32 @@ def analyze_dataframes(
         .sort_values("failed_ops", ascending=False)
     )
 
+    # Broken networks
     broken_base = df[df["networkId"].isin(broken_network_ids)].copy()
-    if "datetime" in broken_base.columns:
-        broken_base = broken_base.sort_values("datetime", ascending=True)
+    broken_base = broken_base.sort_values("datetime", ascending=True)
+
     broken_df = (
         broken_base
         .drop_duplicates(subset=["networkId"], keep="last")
-        .loc[:, ["datetime","networkName","networkId","action","status","error_message","beacon_status","beacon_progress","source_file"]]
+        .loc[:, [
+            "customerId", "companySize",
+            "datetime", "networkName", "networkId", "action", "status",
+            "error_message", "beacon_status", "beacon_progress", "source_file"
+        ]]
         .sort_values("datetime", ascending=False)
         .reset_index(drop=True)
     )
 
+    # Reorder
+    failed_ops = _reorder_with_priority(failed_ops, ["customerId", "companySize"])
+    df = _reorder_with_priority(df, ["customerId", "companySize"])
+
     artifacts = {
-        "failed_operations": sanitize_drop_email_columns(sanitize_redact_emails(failed_ops)),
+        "failed_operations": sanitize_redact_emails(failed_ops),
         "error_summary": sanitize_redact_emails(error_freq),
         "failures_by_action": fail_by_action,
-        "broken_networks": sanitize_drop_email_columns(sanitize_redact_emails(broken_df)),
-        "combined": sanitize_drop_email_columns(sanitize_redact_emails(df)),
+        "broken_networks": sanitize_redact_emails(broken_df),
+        "combined": sanitize_redact_emails(df),
     }
 
     summary = {
